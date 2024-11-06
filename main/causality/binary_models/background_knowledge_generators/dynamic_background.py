@@ -114,4 +114,4 @@ with open(path,'r') as file:
 
 memory, atoms, elapsed_time = generate_and_evaluate_by_levels(data)
 
-print(atoms)
+print(f"Actual Val Atoms are: {atoms}")
