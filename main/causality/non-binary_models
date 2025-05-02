@@ -1,0 +1,341 @@
+import json
+import logging
+import math
+import os
+import random
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+
+###############################################################################
+# Configuration & logging                                                    #
+###############################################################################
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+###############################################################################
+# Utility helpers                                                             #
+###############################################################################
+
+def choose_modulus(ex_max: int, k: float = 1.5) -> int:
+    """Return a positive *integer* modulus strictly larger than ``ex_max``."""
+    return int(max(1, math.ceil(k * ex_max)))
+
+
+###############################################################################
+# DAG generation                                                              #
+###############################################################################
+
+def _safe_randint(low: int, high: int) -> int:
+    """``random.randint`` that tolerates *low > high* by returning 0."""
+    return random.randint(low, high) if low <= high else 0
+
+
+def generate_dag(
+    n_vars: int, mu_target: float, cv_target: float
+) -> Tuple[List[str], Dict[str, List[str]], Dict[str, float]]:
+    """Generate a random DAG aiming for a *mean* in‑degree of ``mu_target``.
+
+    *The function name retains ``mu`` for backward compatibility.*
+    """
+    low = max(0, math.ceil(mu_target * (1 - cv_target)))
+    high = min(n_vars - 1, math.ceil(mu_target * (1 + cv_target)))
+
+    variables = [f"v{i}" for i in range(n_vars)]
+    random.shuffle(variables)
+    topo: List[str] = variables.copy()
+    deps: Dict[str, List[str]] = {}
+
+    for i, var in enumerate(topo):
+        possible_parents = topo[:i]
+        if not possible_parents:
+            deps[var] = []
+            continue
+        num_parents = _safe_randint(min(low, i), min(high, i))
+        deps[var] = random.sample(possible_parents, num_parents)
+
+    in_degrees = [len(deps[v]) for v in topo]
+    mu_emp = float(np.mean(in_degrees))
+    sigma_emp = float(np.std(in_degrees))
+    return topo, deps, {"mu": mu_emp, "sigma": sigma_emp, "cv": sigma_emp / mu_emp if mu_emp else float("nan")}
+
+
+def generate_family_of_dags(
+    n_vars: int,
+    mu_values: List[float],
+    cv_values: List[float],
+    per_setting: int,
+):
+    """Generate a grid ``{μ: {CV: [replicates]}}`` of DAGs."""
+    fam: Dict[float, Dict[float, list]] = {}
+    for mu in mu_values:
+        fam[mu] = {}
+        for cv in cv_values:
+            fam[mu][cv] = [generate_dag(n_vars, mu, cv) for _ in range(per_setting)]
+    return fam
+
+
+###############################################################################
+# Structural‑equation helpers                                                 #
+###############################################################################
+
+def assign_variable_types(order: List[str], boolean_frac: float = 0.5) -> Dict[str, str]:
+    n_bool = int(boolean_frac * len(order))
+    bool_vars = set(random.sample(order, n_bool))
+    return {v: ("boolean" if v in bool_vars else "integer") for v in order}
+
+
+# ── Depth‑aware coefficient sampling ────────────────────────────────────────
+
+def compute_depths(order: List[str], deps: Dict[str, List[str]]) -> Dict[str, int]:
+    depth = defaultdict(lambda: 1)
+    for v in order:
+        depth[v] = 1 + max((depth[p] for p in deps[v]), default=0)
+    return depth
+
+
+def depth_limited_coef(depth: int, fan_in: int, base: int = 5, alpha: float = 1.0) -> int:
+    limit = max(1, base // (depth ** alpha) // max(1, fan_in))
+    coef = 0
+    while coef == 0:
+        coef = random.randint(-limit, limit)
+    return coef
+
+
+# ── Linear equation generation ──────────────────────────────────────────────
+
+def generate_linear_equations(
+    order: List[str],
+    deps: Dict[str, List[str]],
+    var_types: Dict[str, str],
+    coef_limit: int = 5,
+    intercept_limit: int = 10,
+    alpha: float = 1.0,
+) -> Dict[str, dict]:
+    depths = compute_depths(order, deps)
+    eqs: Dict[str, dict] = {}
+    for v in order:
+        parents = deps.get(v, [])
+        if not parents:
+            continue
+        fan_in = len(parents)
+        coefs = {p: depth_limited_coef(depths[v], fan_in, coef_limit, alpha) for p in parents}
+        eqs[v] = {"coefs": coefs, "intercept": random.randint(-intercept_limit, intercept_limit)}
+    return eqs
+
+
+###############################################################################
+# Interval helpers for modular arithmetic                                    #
+###############################################################################
+
+def full_interval(M: int):
+    return [[0, M]]
+
+
+def exact_mod_intervals(L: int, U: int, M: int):
+    """Return the minimal set of half‑open intervals that equal ``{x mod M | L ≤ x ≤ U}``."""
+    if U - L + 1 >= M:
+        return full_interval(M)
+    block_lo, block_hi = L // M, U // M
+    if block_lo == block_hi:
+        return [[L % M, (U % M) + 1]]
+    return [[0, (U % M) + 1], [L % M, M]]
+
+
+###############################################################################
+# Range propagation                                                          #
+###############################################################################
+
+def propagate_ranges(
+    order: List[str],
+    deps: Dict[str, List[str]],
+    var_types: Dict[str, str],
+    eqs: Dict[str, dict],
+    ex_max: int,
+):
+    """Forward interval propagation with support for *mod* in every equation."""
+    expr: Dict[str, List[List[int]]] = {}
+    val: Dict[str, List[List[int]]] = {}
+
+    # 1. exogenous -----------------------------------------------------------
+    for v in order:
+        if v in eqs:
+            continue
+        if var_types[v] == "boolean":
+            expr[v] = val[v] = [[0, 2]]
+        else:
+            expr[v] = val[v] = [[0, ex_max + 1]]
+
+    # 2. endogenous ----------------------------------------------------------
+    for v in order:
+        if v not in eqs:
+            continue
+        eq = eqs[v]
+
+        # accumulate raw affine min/max
+        lo_raw = hi_raw = 0
+        for p, a in eq["coefs"].items():
+            pl, ph_excl = expr[p][0]
+            pl, ph = pl, ph_excl - 1
+            if a >= 0:
+                lo_raw += a * pl
+                hi_raw += a * ph
+            else:
+                lo_raw += a * ph
+                hi_raw += a * pl
+        lo_raw += eq["intercept"]
+        hi_raw += eq["intercept"]
+
+        if "mod" in eq:
+            M = eq["mod"]
+            intervals = exact_mod_intervals(lo_raw, hi_raw, M)
+            expr[v] = val[v] = intervals
+        else:
+            expr[v] = val[v] = [[lo_raw, hi_raw + 1]]
+
+    return expr, val
+
+
+###############################################################################
+# Boolean post‑processing                                                     #
+###############################################################################
+
+def assign_boolean_comparisons(
+    eqs: Dict[str, dict],
+    var_types: Dict[str, str],
+    expr_ranges: Dict[str, List[List[int]]],
+    value_ranges: Dict[str, List[List[int]]],
+):
+    ops = ["<", "<=", "==", "!=", ">", ">="]
+    for v, eq in eqs.items():
+        if var_types[v] != "boolean":
+            continue
+        lo, hi_excl = expr_ranges[v][0]
+        hi = hi_excl - 1
+        eq["comparison"] = {"op": random.choice(ops), "value": random.randint(lo, hi)}
+        value_ranges[v] = [[0, 2]]
+        eq["expr_range"] = [lo, hi]
+
+
+###############################################################################
+# Causal‑model assembly                                                      #
+###############################################################################
+
+def build_causal_model(
+    order: List[str],
+    deps: Dict[str, List[str]],
+    var_types: Dict[str, str],
+    value_ranges: Dict[str, List[List[int]]],
+    eqs: Dict[str, dict],
+):
+    model = {"exogenous": [], "endogenous": {}}
+    for v in order:
+        v_l = v.lower()
+        if not deps.get(v):
+            model["exogenous"].append(v_l)
+            continue
+        eq = eqs[v]
+        entry = {
+            "type": var_types[v],
+            "range": value_ranges[v],
+            "equation": {
+                "coefs": {p.lower(): c for p, c in eq["coefs"].items()},
+                "intercept": eq["intercept"],
+                "mod": eq["mod"],
+            },
+        }
+        if "expr_range" in eq:
+            entry["equation"]["expr_range"] = eq["expr_range"]
+        if "comparison" in eq:
+            entry["equation"]["comparison"] = eq["comparison"]
+        model["endogenous"][v_l] = entry
+    return model
+
+
+###############################################################################
+# IO                                                                          #
+###############################################################################
+
+def save_replicate(
+    model: dict,
+    out_dir: Path,
+    n_vars: int,
+    ex_max: int,
+    mu: float,
+    cv: float,
+    rep_idx: int,
+    n_reps: int,
+):
+    stem = f"N{n_vars:04d}_ex{ex_max:03d}_mu{mu:.3f}_cv{cv:.2f}_rep{rep_idx}of{n_reps}".replace(".", "_")
+    fpath = out_dir / f"{stem}.json"
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    with fpath.open("w", encoding="utf-8") as fh:
+        json.dump(model, fh, indent=4)
+
+
+###############################################################################
+# Diagnostics                                                                 #
+###############################################################################
+
+def first_layer_fan_in(order: List[str], deps: Dict[str, List[str]]):
+    exog = {v: (len(deps[v]) == 0) for v in order}
+    return {v: len(deps[v]) for v in order if deps[v] and all(exog[p] for p in deps[v])}
+
+
+###############################################################################
+# Main generation loop                                                        #
+###############################################################################
+
+def main():
+    n_list = [200, 400, 1000, 2000, 4000]
+    frac_list = [0.005, 0.01, 0.02]
+    cv_list = [0.3, 0.6, 0.9]
+    exo_max_list = [20, 200, 2000, 4000]
+    n_reps = 2
+    out_dir = Path("/Users/hakano/Documents/Computing/actual_causation/automating_causal_queries"
+                   "/learning_causes_experiments/non_binary_models")
+
+    total = len(n_list) * len(exo_max_list) * len(frac_list) * len(cv_list) * n_reps
+    logger.info("Generating %d models …", total)
+
+    max_bound = 0
+
+    for n_vars in n_list:
+        max_mu = (n_vars - 1) / 2
+        mu_values = [f * max_mu for f in frac_list]
+        fam = generate_family_of_dags(n_vars, mu_values, cv_list, n_reps)
+
+        for ex_max in exo_max_list:
+            for mu, cv_dict in fam.items():
+                for cv, dags in cv_dict.items():
+                    for rep_idx, (order, deps, stats) in enumerate(dags, 1):
+                        var_types = assign_variable_types(order, boolean_frac=0.5)
+                        eqs = generate_linear_equations(order, deps, var_types)
+
+                        # Attach a *single* modulus used by every endogenous eq
+                        M_model = choose_modulus(ex_max, k=1.5)
+                        for eq in eqs.values():
+                            eq["mod"] = M_model
+
+                        expr_ranges, value_ranges = propagate_ranges(order, deps, var_types, eqs, ex_max)
+
+                        # Bound tracker --------------------------------------
+                        loc_max = max(abs(b) for ivals in expr_ranges.values() for lo, hi in ivals for b in (lo, hi))
+                        max_bound = max(max_bound, loc_max)
+
+                        assign_boolean_comparisons(eqs, var_types, expr_ranges, value_ranges)
+                        model = build_causal_model(order, deps, var_types, value_ranges, eqs)
+                        save_replicate(model, out_dir, n_vars, ex_max, mu, cv, rep_idx, n_reps)
+
+    logger.info("Finished. Largest |bound| encountered = %d", max_bound)
+
+
+if __name__ == "__main__":
+    main()
